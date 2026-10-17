@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# pmctl — Passmower CLI
+# kubectl plugin: place this file on $PATH as kubectl-passmower or kubectl-pmctl
+set -euo pipefail
+
+PMCTL_VERSION="0.1.0"
+API_GROUP="codemowers.cloud"
+RESOURCE="oidcusers.${API_GROUP}"
+PASSWORD_SECRET_PREFIX="passmower-password"
+KUBECTL="${KUBECTL:-kubectl}"
+
+die() { echo "error: $*" >&2; exit 1; }
+require_arg() { [ "${1:-}" ] || die "missing argument: $2"; }
+
+passmower_namespace() {
+    echo "${PASSMOWER_NAMESPACE:-$($KUBECTL config view --minify \
+        -o jsonpath='{..namespace}' 2>/dev/null || echo default)}"
+}
+
+hash_password() {
+    local password="$1"
+    if command -v htpasswd &>/dev/null; then
+        local test_out
+        test_out=$(printf 'probe' | htpasswd -nbBi _probe_ 2>/dev/null || true)
+        if [ -n "$test_out" ]; then
+            printf '%s' "$password" | htpasswd -nbBi _pmctl_ 2>/dev/null | cut -d: -f2
+            return 0
+        fi
+    fi
+    if python3 -c "import bcrypt" &>/dev/null 2>&1; then
+        PMCTL_PW="$password" python3 - <<'PYEOF'
+import bcrypt, os
+pw = os.environ['PMCTL_PW'].encode()
+print(bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12)).decode())
+PYEOF
+        return 0
+    fi
+    die "no bcrypt provider — install apache2-utils or python3-bcrypt"
+}
+
+read_password() {
+    local p1 p2
+    read -r -s -p "New password: "  p1 <&2; echo >&2
+    read -r -s -p "Confirm:       " p2 <&2; echo >&2
+    [ "$p1" = "$p2" ] || die "passwords do not match"
+    [ -n "$p1" ]      || die "password must not be empty"
+    printf '%s' "$p1"
+}
+
+cmd_users() {
+    $KUBECTL get "$RESOURCE" \
+        -o custom-columns='NAME:.metadata.name,EMAIL:.status.primaryEmail,APPROVED:.passmower.approved,GROUPS:.status.groups[*].name' "$@"
+}
+
+cmd_get() {
+    require_arg "${1:-}" username
+    $KUBECTL get "$RESOURCE" "$1" -o yaml
+}
+
+cmd_approve() {
+    require_arg "${1:-}" username
+    $KUBECTL patch "$RESOURCE" "$1" --type=merge -p '{"passmower":{"approved":true}}' >/dev/null
+    echo "User '$1' approved"
+}
+
+cmd_unapprove() {
+    require_arg "${1:-}" username
+    $KUBECTL patch "$RESOURCE" "$1" --type=merge -p '{"passmower":{"approved":null}}' >/dev/null
+    echo "User '$1' approval revoked"
+}
+
+cmd_groups() {
+    require_arg "${1:-}" username
+    local out
+    out=$($KUBECTL get "$RESOURCE" "$1" \
+        -o jsonpath='{range .status.groups[*]}{.prefix}:{.name}{"\n"}{end}')
+    [ -z "$out" ] && echo "(no groups)" || printf '%s\n' "$out"
+}
+
+cmd_set_password() {
+    require_arg "${1:-}" username
+    local username="$1" ns
+    ns=$(passmower_namespace)
+    $KUBECTL get "$RESOURCE" "$username" &>/dev/null || die "OIDCUser '$username' not found"
+    local password
+    if [ -t 0 ]; then
+        password=$(read_password)
+    else
+        IFS= read -r password
+        [ -n "$password" ] || die "password must not be empty"
+    fi
+    local hash hash_b64 secret_name
+    hash=$(hash_password "$password")
+    hash_b64=$(printf '%s' "$hash" | base64 | tr -d '\n')
+    secret_name="${PASSWORD_SECRET_PREFIX}-${username}"
+    $KUBECTL apply --server-side --field-manager=pmctl -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret_name}
+  namespace: ${ns}
+  labels:
+    app.kubernetes.io/managed-by: passmower
+    codemowers.cloud/oidc-user: ${username}
+type: Opaque
+data:
+  hash: ${hash_b64}
+EOF
+    echo "Password set for '$username'"
+}
+
+cmd_remove_password() {
+    require_arg "${1:-}" username
+    local ns
+    ns=$(passmower_namespace)
+    $KUBECTL delete secret "${PASSWORD_SECRET_PREFIX}-${1}" -n "$ns" 2>/dev/null \
+        && echo "Password removed for '$1'" \
+        || echo "No password secret found for '$1'"
+}
+
+cmd_add_group() {
+    require_arg "${1:-}" username
+    require_arg "${2:-}" "group"
+    local username="$1" group="$2" prefix name
+    command -v jq &>/dev/null || die "jq is required"
+    if [[ "$group" == *:* ]]; then
+        prefix="${group%%:*}"
+        name="${group#*:}"
+    else
+        prefix="${GROUP_PREFIX:-local}"
+        name="$group"
+    fi
+    local current
+    current=$($KUBECTL get "$RESOURCE" "$username" \
+        -o jsonpath='{.passmower.groups}' 2>/dev/null || true)
+    [ -z "$current" ] && current="null"
+    local new_groups
+    if [ "$current" = "null" ]; then
+        new_groups="[{\"prefix\":\"${prefix}\",\"name\":\"${name}\"}]"
+    else
+        if printf '%s' "$current" | jq -e ".[] | select(.prefix==\"${prefix}\" and .name==\"${name}\")" &>/dev/null; then
+            echo "already has '${prefix}:${name}'"
+            return 0
+        fi
+        new_groups=$(printf '%s' "$current" | jq ". + [{\"prefix\":\"${prefix}\",\"name\":\"${name}\"}]")
+    fi
+    $KUBECTL patch "$RESOURCE" "$username" --type=merge \
+        -p "{\"passmower\":{\"groups\":${new_groups}}}" >/dev/null
+    echo "Added '${prefix}:${name}' to '$username'"
+}
+
+cmd_remove_group() {
+    require_arg "${1:-}" username
+    require_arg "${2:-}" "group"
+    local username="$1" group="$2" prefix name
+    command -v jq &>/dev/null || die "jq is required"
+    if [[ "$group" == *:* ]]; then
+        prefix="${group%%:*}"
+        name="${group#*:}"
+    else
+        prefix="${GROUP_PREFIX:-local}"
+        name="$group"
+    fi
+    local current
+    current=$($KUBECTL get "$RESOURCE" "$username" \
+        -o jsonpath='{.passmower.groups}' 2>/dev/null || true)
+    if [ -z "$current" ] || [ "$current" = "null" ]; then
+        echo "no custom groups"
+        return 0
+    fi
+    local new_groups
+    new_groups=$(printf '%s' "$current" | jq "[.[] | select(.prefix != \"${prefix}\" or .name != \"${name}\")]")
+    $KUBECTL patch "$RESOURCE" "$username" --type=merge \
+        -p "{\"passmower\":{\"groups\":${new_groups}}}" >/dev/null
+    echo "Removed '${prefix}:${name}' from '$username'"
+}
+
+usage() {
+    cat <<'EOF'
+pmctl — Passmower kubectl helper
+
+Usage: pmctl <command> [args…]
+
+User management:
+  users                          list all OIDCUsers
+  get <user>                     show OIDCUser YAML
+  approve <user>                 set approved: true
+  unapprove <user>               remove approval
+
+Group management:
+  groups <user>                  list groups
+  add-group <user> <prefix:name> add a group (prefix defaults to $GROUP_PREFIX or "local")
+  remove-group <user> <prefix:name>
+
+Password management (server-side password login must be enabled in Passmower):
+  set-password <user>            hash and store bcrypt password Secret
+  remove-password <user>         delete password Secret
+
+Environment:
+  PASSMOWER_NAMESPACE  namespace where Passmower is deployed (default: current context namespace)
+  GROUP_PREFIX         default prefix for bare group names (default: local)
+  KUBECTL              kubectl binary to use (default: kubectl)
+
+kubectl plugin:
+  Install as "kubectl-passmower" or "kubectl-pmctl" on $PATH to use as:
+    kubectl passmower <command>
+    kubectl pmctl <command>
+EOF
+}
+
+main() {
+    [ $# -eq 0 ] && { usage; exit 1; }
+    local cmd="$1"; shift
+    case "$cmd" in
+        users|list)           cmd_users "$@" ;;
+        get|get-user)         cmd_get "$@" ;;
+        set-password)         cmd_set_password "$@" ;;
+        remove-password)      cmd_remove_password "$@" ;;
+        approve)              cmd_approve "$@" ;;
+        unapprove)            cmd_unapprove "$@" ;;
+        groups)               cmd_groups "$@" ;;
+        add-group)            cmd_add_group "$@" ;;
+        remove-group)         cmd_remove_group "$@" ;;
+        version|-v|--version) printf 'pmctl %s\n' "$PMCTL_VERSION" ;;
+        help|-h|--help)       usage ;;
+        *)                    echo "unknown command: $cmd" >&2; echo "try: pmctl help" >&2; exit 1 ;;
+    esac
+}
+main "$@"
