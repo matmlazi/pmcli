@@ -5,13 +5,15 @@
 ## Installation
 
 ```bash
-curl -Lo ~/.local/bin/pmctl https://raw.githubusercontent.com/passmower/pmcli/main/pmctl
+curl -Lo ~/.local/bin/pmctl https://raw.githubusercontent.com/matmlazi/pmcli/master/pmctl
 chmod +x ~/.local/bin/pmctl
 
 # Optional: install as kubectl plugin
 ln -s ~/.local/bin/pmctl ~/.local/bin/kubectl-passmower
 # Then: kubectl passmower <command>
 ```
+
+> **Note:** this repo will be transferred to the `passmower` org shortly.
 
 ## Requirements
 
